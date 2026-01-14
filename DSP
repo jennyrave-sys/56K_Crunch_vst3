@@ -1,0 +1,179 @@
+#ifndef CRUNCH_DSP_H
+#define CRUNCH_DSP_H
+
+#include <cmath>
+#include <cstdlib>
+#include <algorithm>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+class BiquadHPF {
+public:
+    void setSampleRate(double sr) { sampleRate = sr; }
+
+    void updateCoefficients(float frequency) {
+        if (sampleRate <= 0.0) return;
+        
+        double omega = 2.0 * M_PI * frequency / sampleRate;
+        double cosOmega = std::cos(omega);
+        double alpha = std::sin(omega) / (2.0 * 0.7071);
+
+        double b0 =  (1.0 + cosOmega) / 2.0;
+        double b1 = -(1.0 + cosOmega);
+        double b2 =  (1.0 + cosOmega) / 2.0;
+        double a0 =   1.0 + alpha;
+        double a1 =  -2.0 * cosOmega;
+        double a2 =   1.0 - alpha;
+
+        c_b0 = b0 / a0;
+        c_b1 = b1 / a0;
+        c_b2 = b2 / a0;
+        c_a1 = a1 / a0;
+        c_a2 = a2 / a0;
+    }
+
+    float process(float input) {
+        double output = c_b0 * input + c_b1 * x1 + c_b2 * x2 - c_a1 * y1 - c_a2 * y2;
+        
+        x2 = x1;
+        x1 = input;
+        y2 = y1;
+        y1 = output;
+
+        return static_cast<float>(output);
+    }
+
+    void reset() { x1 = x2 = y1 = y2 = 0.0; }
+
+private:
+    double sampleRate = 44100.0;
+    double c_b0 = 1.0, c_b1 = 0.0, c_b2 = 0.0, c_a1 = 0.0, c_a2 = 0.0;
+    double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
+};
+
+class CrunchDSP {
+public:
+    CrunchDSP() {
+        reset();
+    }
+
+    void prepare(double sampleRate) {
+        this->sampleRate = sampleRate;
+        hpfLeft.setSampleRate(sampleRate);
+        hpfRight.setSampleRate(sampleRate);
+        reset();
+    }
+
+    void reset() {
+        sampleCounterLeft = 0.0;
+        sampleCounterRight = 0.0;
+        lastOutLeft = 0.0f;
+        lastOutRight = 0.0f;
+        controlCounter = 0;
+        hpfLeft.reset();
+        hpfRight.reset();
+    }
+
+    void setInputdB(float db)     { inputGain = dbToLinear(db); inputDbVal = db; }
+    void setSaturation(float pct) { satBlend = pct / 100.0f; }
+    void setMHz(float mhz)        { targetMHz = mhz; }
+    void setJitter(float pct)     { jitterAmount = pct / 100.0f; }
+    void setHPF(float freq)       { targetHPF = freq; }
+    void setOutputdB(float db)    { outputDbVal = db; }
+
+    void processStereo(float* leftSample, float* rightSample) {
+        updateControlRateLogic();
+
+        *leftSample  = processSingleChannel(*leftSample,  0);
+        *rightSample = processSingleChannel(*rightSample, 1);
+        
+        controlCounter++;
+    }
+
+private:
+    double sampleRate = 44100.0;
+    int controlCounter = 0;
+    
+    float currentMHz = 500.0f;
+    float currentHPF = 20.0f;
+
+    float inputGain = 1.0f;
+    float inputDbVal = 0.0f;
+    float outputDbVal = 0.0f;
+    float satBlend = 0.0f;
+    float targetMHz = 500.0f;
+    float targetHPF = 20.0f;
+    float jitterAmount = 0.0f;
+
+    double sampleCounterLeft = 0.0;
+    double sampleCounterRight = 0.0;
+    float lastOutLeft = 0.0f;
+    float lastOutRight = 0.0f;
+    
+    BiquadHPF hpfLeft;
+    BiquadHPF hpfRight;
+
+    inline float dbToLinear(float db) {
+        return std::pow(10.0f, db / 20.0f);
+    }
+
+    void updateControlRateLogic() {
+        if (controlCounter % 32 == 0) {
+            currentMHz = targetMHz;
+            currentHPF = targetHPF;
+            hpfLeft.updateCoefficients(currentHPF);
+            hpfRight.updateCoefficients(currentHPF);
+        }
+    }
+
+    float processSingleChannel(float input, int channelId) {
+        double& sampleCounter = (channelId == 0) ? sampleCounterLeft : sampleCounterRight;
+        float& lastOut = (channelId == 0) ? lastOutLeft : lastOutRight;
+        BiquadHPF& hpf = (channelId == 0) ? hpfLeft : hpfRight;
+
+        double signal = (double)input * inputGain;
+
+        float clockRatio = 500.0f / currentMHz;
+        
+        if (std::fmod(sampleCounter, (double)clockRatio) > 1.0) {
+            sampleCounter++;
+            return lastOut;
+        }
+
+        double scaled = signal * 8388608.0;
+
+        const double limit = 8388607.0;
+        double x = scaled / limit;
+
+        double driveBoost = 1.0 + (satBlend * 5.0);
+        x *= driveBoost;
+
+        double soft = std::tanh(x);
+        double hard = (x > 1.0) ? 1.0 : ((x < -1.0) ? -1.0 : x);
+        double shaped = soft + (hard - soft) * satBlend;
+        
+        scaled = shaped * limit;
+
+        if (jitterAmount > 0.0f) {
+            double noise = ((double)rand() / (double)RAND_MAX - 0.5) * jitterAmount * 4.0;
+            scaled += noise;
+        }
+
+        int32_t quantized = static_cast<int32_t>(std::round(scaled));
+
+        float output = static_cast<float>(quantized) / 8388608.0f;
+
+        output = hpf.process(output);
+
+        float compensationDb = outputDbVal - (inputDbVal * 0.5f);
+        output *= dbToLinear(compensationDb);
+
+        lastOut = output;
+        sampleCounter++;
+        return output;
+    }
+};
+
+#endif
